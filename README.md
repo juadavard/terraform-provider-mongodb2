@@ -21,7 +21,7 @@ Main changes of this provider compared to original provider are:
 1. Build the provider using the `make install` command:
 
 ````bash
-git clone https://github.com/gmilowamw/mongodb2
+git clone https://github.com/gmilowamw/terraform-provider-mongodb2
 cd terraform-provider-mongodb2
 make install
 ````

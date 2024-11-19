@@ -1,4 +1,4 @@
-module github.com/gmilowamw/mongodb2
+module github.com/gmilowamw/terraform-provider-mongodb2
 
 go 1.17
 
