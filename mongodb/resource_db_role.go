@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
+
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/mitchellh/mapstructure"
-	"go.mongodb.org/mongo-driver/bson"
-	"strings"
 )
 
 func resourceDatabaseRole() *schema.Resource {
@@ -24,7 +24,7 @@ func resourceDatabaseRole() *schema.Resource {
 			"database": {
 				Type:     schema.TypeString,
 				Optional: true,
-				Default: "admin",
+				Default:  "admin",
 			},
 			"name": {
 				Type:     schema.TypeString,
@@ -77,59 +77,116 @@ func resourceDatabaseRole() *schema.Resource {
 	}
 }
 
-func resourceDatabaseRoleCreate(ctx context.Context, data *schema.ResourceData, i interface{}) diag.Diagnostics {
-	var config = i.(*MongoDatabaseConfiguration)
-	client , connectionError := MongoClientInit(config)
-	if connectionError != nil {
-		return diag.Errorf("Error connecting to database : %s ", connectionError)
-	}
-	var role = data.Get("name").(string)
+func readRoleFromData(data *schema.ResourceData) (*Role, error) {
+	var roleName = data.Get("name").(string)
 	var database = data.Get("database").(string)
-	var roleList []Role
-	var privileges []PrivilegeDto
+	var roleList []RoleReference
+	var privileges []Privilege
 
 	privilege := data.Get("privilege").(*schema.Set).List()
 	roles := data.Get("inherited_role").(*schema.Set).List()
 
 	roleMapErr := mapstructure.Decode(roles, &roleList)
 	if roleMapErr != nil {
-		return diag.Errorf("Error decoding map : %s ", roleMapErr)
+		return nil, roleMapErr
 	}
 	privMapErr := mapstructure.Decode(privilege, &privileges)
 	if privMapErr != nil {
-		return diag.Errorf("Error decoding map : %s ", privMapErr)
+		return nil, privMapErr
 	}
 
+	role := Role{
+		Name:       roleName,
+		Database:   database,
+		Roles:      roleList,
+		Privileges: privileges,
+	}
 
-	err := createRole(client, role, roleList, privileges, database)
+	return &role, nil
+}
 
+func writeRoleToData(data *schema.ResourceData, role *Role) error {
+	if role == nil {
+		data.SetId("")
+		return nil
+	}
+
+	inheritedRoles := make([]interface{}, len(role.Roles))
+	for i, s := range role.Roles {
+		inheritedRoles[i] = map[string]interface{}{
+			"db":   s.Db,
+			"role": s.Role,
+		}
+	}
+
+	privileges := make([]interface{}, len(role.Privileges))
+	for i, s := range role.Privileges {
+		privileges[i] = map[string]interface{}{
+			"db":         s.Db,
+			"collection": s.Collection,
+			"actions":    s.Actions,
+		}
+	}
+	err := data.Set("inherited_role", inheritedRoles)
 	if err != nil {
-		return diag.Errorf("Could not create the role : %s ", err)
+		return err
 	}
-	str := database+"."+role
-	encoded := base64.StdEncoding.EncodeToString([]byte(str))
-	data.SetId(encoded)
-	return resourceDatabaseRoleRead(ctx, data, i)
+	err = data.Set("privilege", privileges)
+	if err != nil {
+		return err
+	}
+	err = data.Set("database", role.Database)
+	if err != nil {
+		return err
+	}
+	err = data.Set("name", role.Name)
+	if err != nil {
+		return err
+	}
+	data.SetId(makeRoleId(role.Name, role.Database))
+	return nil
+}
+
+func resourceDatabaseRoleCreate(ctx context.Context, data *schema.ResourceData, i interface{}) diag.Diagnostics {
+	var config = i.(*MongoDatabaseConfiguration)
+	client, connectionError := MongoClientInit(config)
+	if connectionError != nil {
+		return diag.Errorf("Error connecting to database : %s ", connectionError)
+	}
+
+	role, readRoleErr := readRoleFromData(data)
+	if readRoleErr != nil {
+		return diag.Errorf("Error reading role : %s ", readRoleErr)
+	}
+
+	createRoleErr := createRole(client, role)
+	if createRoleErr != nil {
+		return diag.Errorf("Could not create the role : %s ", createRoleErr)
+	}
+
+	writeRoleErr := writeRoleToData(data, role)
+	if writeRoleErr != nil {
+		return diag.Errorf("Error writing role : %s ", writeRoleErr)
+	}
+
+	return nil
 }
 
 func resourceDatabaseRoleDelete(ctx context.Context, data *schema.ResourceData, i interface{}) diag.Diagnostics {
 	var config = i.(*MongoDatabaseConfiguration)
-	client , connectionError := MongoClientInit(config)
+	client, connectionError := MongoClientInit(config)
 	if connectionError != nil {
 		return diag.Errorf("Error connecting to database : %s ", connectionError)
 	}
-	var stateId = data.State().ID
-	roleName, database , err := resourceDatabaseRoleParseId(stateId)
 
-	if err != nil {
-		return diag.Errorf("%s", err)
+	roleName, database, parseRoleIdErr := parseRoleId(data.State().ID)
+	if parseRoleIdErr != nil {
+		return diag.Errorf("%s", parseRoleIdErr)
 	}
 
-	db := client.Database(database)
-	result := db.RunCommand(context.Background(), bson.D{{Key: "dropRole", Value: roleName}})
-
-	if result.Err() != nil {
-		return diag.Errorf("%s",result.Err())
+	dropRoleErr := dropRole(client, roleName, database)
+	if dropRoleErr != nil {
+		return diag.Errorf("Error deleting the role: %s ", dropRoleErr)
 	}
 
 	return nil
@@ -137,113 +194,66 @@ func resourceDatabaseRoleDelete(ctx context.Context, data *schema.ResourceData, 
 
 func resourceDatabaseRoleUpdate(ctx context.Context, data *schema.ResourceData, i interface{}) diag.Diagnostics {
 	var config = i.(*MongoDatabaseConfiguration)
-	client , connectionError := MongoClientInit(config)
+	client, connectionError := MongoClientInit(config)
 	if connectionError != nil {
 		return diag.Errorf("Error connecting to database : %s ", connectionError)
 	}
-	var role = data.Get("name").(string)
-	var stateId = data.State().ID
-	roleName, database , err := resourceDatabaseRoleParseId(stateId)
 
-	if err != nil {
-		return diag.Errorf("%s",err)
+	_, _, parseRoleIdErr := parseRoleId(data.State().ID)
+	if parseRoleIdErr != nil {
+		return diag.Errorf("%s", parseRoleIdErr)
 	}
 
-	db := client.Database(database)
-	result := db.RunCommand(context.Background(), bson.D{{Key: "dropRole", Value: roleName}})
-
-	if result.Err() != nil {
-		return diag.Errorf("%s", result.Err())
+	role, readRoleErr := readRoleFromData(data)
+	if readRoleErr != nil {
+		return diag.Errorf("Error reading role : %s ", readRoleErr)
 	}
 
-	var roleList []Role
-	var privileges []PrivilegeDto
-
-	privilege := data.Get("privilege").(*schema.Set).List()
-	roles := data.Get("inherited_role").(*schema.Set).List()
-
-	roleMapErr := mapstructure.Decode(roles, &roleList)
-	if roleMapErr != nil {
-		return diag.Errorf("Error decoding map : %s ", roleMapErr)
-	}
-	privMapErr := mapstructure.Decode(privilege, &privileges)
-	if privMapErr != nil {
-		return diag.Errorf("Error decoding map : %s ", privMapErr)
+	dropRoleErr := dropRole(client, role.Name, role.Database)
+	if dropRoleErr != nil {
+		return diag.Errorf("Error deleting the role: %s ", dropRoleErr)
 	}
 
-	err2 := createRole(client, role, roleList, privileges, database)
-
-	if err2 != nil {
-		return diag.Errorf("Could not create the role  :  %s ", err)
+	createRoleErr := createRole(client, role)
+	if createRoleErr != nil {
+		return diag.Errorf("Could not create the role  :  %s ", createRoleErr)
 	}
-	str := database+"."+role
-	encoded := base64.StdEncoding.EncodeToString([]byte(str))
-	data.SetId(encoded)
 
+	writeRoleErr := writeRoleToData(data, role)
+	if writeRoleErr != nil {
+		return diag.Errorf("Error writing role : %s ", writeRoleErr)
+	}
 
-	return resourceDatabaseRoleRead(ctx, data, i)
+	return nil
 }
 
 func resourceDatabaseRoleRead(ctx context.Context, data *schema.ResourceData, i interface{}) diag.Diagnostics {
-	var diags diag.Diagnostics
 	var config = i.(*MongoDatabaseConfiguration)
-	client , connectionError := MongoClientInit(config)
+	client, connectionError := MongoClientInit(config)
 	if connectionError != nil {
 		return diag.Errorf("Error connecting to database : %s ", connectionError)
 	}
-	stateID := data.State().ID
-	roleName, database , err := resourceDatabaseRoleParseId(stateID)
-	if err != nil {
-		return diag.Errorf("%s",err)
+
+	roleName, database, parseRoleIdErr := parseRoleId(data.State().ID)
+	if parseRoleIdErr != nil {
+		return diag.Errorf("%s", parseRoleIdErr)
 	}
-	result , decodeError := getRole(client,roleName,database)
+
+	role, decodeError := getRole(client, roleName, database)
 	if decodeError != nil {
-		return diag.Errorf("Error decoding role : %s ", err)
-	}
-	if len(result.Roles) == 0 {
-		return diag.Errorf("Role does not exist")
-	}
-	inheritedRoles := make([]interface{}, len(result.Roles[0].InheritedRoles))
-
-	for i, s := range result.Roles[0].InheritedRoles {
-		inheritedRoles[i] = map[string]interface{}{
-			"db": s.Db,
-			"role": s.Role,
-		}
-	}
-	dataSetError := data.Set("inherited_role", inheritedRoles)
-	if dataSetError != nil {
-		return diag.Errorf("Error setting  inherited roles : %s ", err)
-	}
-	privileges := make([]interface{}, len(result.Roles[0].Privileges))
-
-	for i, s := range result.Roles[0].Privileges {
-		privileges[i] = map[string]interface{}{
-			"db": s.Resource.Db,
-			"collection": s.Resource.Collection,
-			"actions": s.Actions,
-		}
-	}
-	dataSetError = data.Set("privilege", privileges)
-	if dataSetError != nil {
-		return diag.Errorf("Error setting role privilege : %s ", err)
-	}
-	dataSetError = data.Set("database", database)
-	if dataSetError != nil {
-		return diag.Errorf("Error setting role database : %s ", err)
-	}
-	dataSetError = data.Set("name", roleName)
-	if dataSetError != nil {
-		return diag.Errorf("Error setting  role nam: %s ", err)
+		return diag.Errorf("Error decoding role : %s ", decodeError)
 	}
 
-	data.SetId(stateID)
-	diags = nil
-	return diags
+	writeRoleErr := writeRoleToData(data, role)
+	if writeRoleErr != nil {
+		return diag.Errorf("Error writing role : %s ", writeRoleErr)
+	}
+
+	return nil
 }
 
-func resourceDatabaseRoleParseId(id string) (string, string, error) {
-	result , errEncoding := base64.StdEncoding.DecodeString(id)
+func parseRoleId(id string) (string, string, error) {
+	result, errEncoding := base64.StdEncoding.DecodeString(id)
 
 	if errEncoding != nil {
 		return "", "", fmt.Errorf("unexpected format of ID Error : %s", errEncoding)
@@ -256,6 +266,10 @@ func resourceDatabaseRoleParseId(id string) (string, string, error) {
 	database := parts[0]
 	roleName := parts[1]
 
-	return roleName , database , nil
+	return roleName, database, nil
 }
 
+func makeRoleId(role string, database string) string {
+	str := database + "." + role
+	return base64.StdEncoding.EncodeToString([]byte(str))
+}

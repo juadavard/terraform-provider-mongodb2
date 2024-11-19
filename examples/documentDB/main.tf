@@ -3,7 +3,7 @@ terraform {
 
   required_providers {
     mongodb = {
-      source = "registry.terraform.io/Kaginari/mongodb"
+      source = "registry.terraform.io/gmilowamw/mongodb2"
       version = "9.9.9"
     }
   }

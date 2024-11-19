@@ -2,11 +2,12 @@ package mongodb
 
 import (
 	"context"
+	"regexp"
+	"time"
+
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
-	"regexp"
-	"time"
 )
 
 func Provider() *schema.Provider {
@@ -31,17 +32,35 @@ func Provider() *schema.Provider {
 				Description: "PEM-encoded content of Mongodb host CA certificate",
 			},
 
+			"auth_schema": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("MONGODB_AUTH_SCHEMA", "PLAIN"),
+				Description: "The authentication schema: PLAIN or MONGODB-X509",
+			},
 			"username": {
 				Type:        schema.TypeString,
-				Required:    true,
+				Optional:    true,
 				DefaultFunc: schema.EnvDefaultFunc("MONGO_USR", nil),
 				Description: "The mongodb user",
 			},
 			"password": {
 				Type:        schema.TypeString,
-				Required:    true,
+				Optional:    true,
 				DefaultFunc: schema.EnvDefaultFunc("MONGO_PWD", nil),
 				Description: "The mongodb password",
+			},
+			"auth_x509_cert": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("MONGODB_X509_CERT", ""),
+				Description: "The x509 authentication certificate, could contain both certificate and key or just certificate; applicable only if auth_schema is MONGODB-X509",
+			},
+			"auth_x509_key": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("MONGODB_X509_KEY", ""),
+				Description: "The x509 authentication key; applicable only if auth_schema is MONGODB-X509",
 			},
 			"auth_database": {
 				Type:        schema.TypeString,
@@ -109,8 +128,11 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 	clientConfig := ClientConfig{
 		Host:               d.Get("host").(string),
 		Port:               d.Get("port").(string),
+		AuthSchema:         d.Get("auth_schema").(string),
 		Username:           d.Get("username").(string),
 		Password:           d.Get("password").(string),
+		AuthX509Cert:       d.Get("auth_x509_cert").(string),
+		AuthX509Key:        d.Get("auth_x509_key").(string),
 		DB:                 d.Get("auth_database").(string),
 		Ssl:                d.Get("ssl").(bool),
 		ReplicaSet:         d.Get("replica_set").(string),
